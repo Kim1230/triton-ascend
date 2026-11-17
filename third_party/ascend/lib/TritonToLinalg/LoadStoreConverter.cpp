@@ -376,6 +376,105 @@ fillTailWithOtherForMaskScenario(Value other, Value localMem,
   }
 }
 
+// [TAIL-FILL-DYN] Env switch for the dynamic-prefix tail fill (default on).
+static bool isDynamicTailFillEnabled() {
+  const char *env = std::getenv("TRITON_ASCEND_DYNAMIC_TAIL_FILL");
+  return !(env && env[0] == '0' && env[1] == '\0');
+}
+
+// [TAIL-FILL-DYN] Eligibility for the dynamic-prefix relaxation: rank-1
+// static-shaped buffer with int/float elements whose size divides 32B. The
+// last dim of mstate.dims may be a runtime SSA value; prefix-from-zero is
+// checked by the caller.
+static bool dynamicTailFillEligible(Value localMem) {
+  auto memRefType = dyn_cast<MemRefType>(localMem.getType());
+  if (!memRefType || !memRefType.hasStaticShape())
+    return false;
+  if (memRefType.getRank() != 1)
+    return false;
+  auto elemTy = memRefType.getElementType();
+  if (!elemTy.isIntOrFloat())
+    return false;
+  unsigned bits = elemTy.getIntOrFloatBitWidth();
+  if (bits == 0 || (32 * 8) % bits != 0)
+    return false;
+  return true;
+}
+
+// [TAIL-FILL-DYN] Emit the complement fill AFTER the copy for a dynamic
+// prefix mask (valid is a runtime value):
+//   copy region : [0, valid)         (MTE2, emitted by the caller before)
+//   narrow head : [valid, alignUp)   scalar loop, no alignment hazard
+//   main tail   : [alignUp, padded)  linalg.fill, 32B-aligned start
+// with K = 32B/elemBytes, alignUp = valid + ((K - valid % K) % K), clamped to
+// padded. Regions are pairwise disjoint from the copy region, so the copy
+// carries no ordering dependency on the fill. The scalar narrow head (at
+// most K-1 iterations) removes the 32B head-hole hazard that the static-only
+// path guards against via tailFillDimsAligned.
+static void fillTailWithOtherDynamicScenario(
+    Value other, Value localMem, ArrayRef<OpFoldResult> maskDim,
+    ConversionPatternRewriter &rewriter) {
+  auto loc = localMem.getLoc();
+  auto memRefType = cast<MemRefType>(localMem.getType());
+  const int64_t padded = memRefType.getShape().back();
+  const unsigned elemBits =
+      memRefType.getElementType().getIntOrFloatBitWidth();
+  const int64_t K = (32 * 8) / elemBits;
+
+  Value validVal;
+  if (isa<Attribute>(maskDim.back())) {
+    validVal = rewriter.create<arith::ConstantOp>(
+        loc, cast<IntegerAttr>(cast<Attribute>(maskDim.back())));
+  } else {
+    validVal = cast<Value>(maskDim.back());
+  }
+  if (!validVal.getType().isIndex()) {
+    validVal = rewriter.create<arith::IndexCastOp>(
+        loc, rewriter.getIndexType(), validVal);
+  }
+
+  Value paddedVal = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getIndexAttr(padded));
+  Value kVal =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(K));
+  Value oneVal =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+  Value zeroVal =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+
+  // validClamped = min(max(valid, 0), padded)
+  Value validLo =
+      rewriter.create<arith::MaxSIOp>(loc, validVal, zeroVal);
+  Value validClamped =
+      rewriter.create<arith::MinSIOp>(loc, validLo, paddedVal);
+
+  // alignUp = validClamped + ((K - validClamped % K) % K), clamped to padded
+  Value rem = rewriter.create<arith::RemSIOp>(loc, validClamped, kVal);
+  Value kMinusRem = rewriter.create<arith::SubIOp>(loc, kVal, rem);
+  Value wrap = rewriter.create<arith::RemSIOp>(loc, kMinusRem, kVal);
+  Value alignRaw = rewriter.create<arith::AddIOp>(loc, validClamped, wrap);
+  Value alignUp = rewriter.create<arith::MinSIOp>(loc, alignRaw, paddedVal);
+
+  // 1) narrow head: scalar loop, at most K-1 iterations.
+  auto headFor =
+      rewriter.create<scf::ForOp>(loc, validClamped, alignUp, oneVal);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(&headFor.getRegion().front());
+    rewriter.create<memref::StoreOp>(loc, other, localMem,
+                                     ValueRange{headFor.getInductionVar()});
+  }
+
+  // 2) main tail: linalg.fill on [alignUp, padded).
+  Value tailSize = rewriter.create<arith::SubIOp>(loc, paddedVal, alignUp);
+  auto subView = rewriter.create<memref::SubViewOp>(
+      loc, localMem, ArrayRef<OpFoldResult>{alignUp},
+      ArrayRef<OpFoldResult>{tailSize},
+      ArrayRef<OpFoldResult>{rewriter.getIndexAttr(1)});
+  rewriter.create<linalg::FillOp>(loc, ValueRange{other},
+                                  ValueRange{subView.getResult()});
+}
+
 LoadConverter::LoadConverter(MLIRContext *context)
     : OpConversionPattern<triton::LoadOp>(context) {}
 
@@ -388,30 +487,30 @@ LoadConverter::LoadConverter(MLIRContext *context)
 //   x = tl.load(in_ptr + offs, mask=mask, other=mask)
 //   tl.store(out_ptr + offs, x, mask=mask)
 //
-// TTIR (fp â€” uitofp; int â€” extui/extsi):
+// TTIR (fp â€?uitofp; int â€?extui/extsi):
 //   %mask  = arith.cmpi slt, %offs, %N : tensor<Nx i1>
-//   %other = arith.uitofp %mask â€¦            // or arith.extui for i8
+//   %other = arith.uitofp %mask â€?           // or arith.extui for i8
 //   %x     = tt.load %ptr, %mask, %other
 //
 // Lowering (linalg):
 //   %alloc = memref.alloc()
 //   memref.copy %src_view, %dst_view         // active SRC only
 //   %loaded = bufferization.to_tensor %alloc
-//   %zeros  = linalg.fill 0                  // [OTHER] cast(mask)â†’0 on pad
+//   %zeros  = linalg.fill 0                  // [OTHER] cast(mask)â†? on pad
 //   %x = arith.select %mask, %loaded, %zeros
 // ---------------------------------------------------------------------------
 // Case 2: other = prior tensor
 //   (Python: other = tl.load(fill_ptr+offs); x = tl.load(ptr, mask=mask,
-//   other=other); tl.store(out, x)  # full store â€” pad must stay OTHER)
+//   other=other); tl.store(out, x)  # full store â€?pad must stay OTHER)
 //
 // TTIR:
 //   %other = tt.load %fill_ptr
 //   %x     = tt.load %ptr, %mask, %other
 //
 // Lowering:
-//   %other_t = bufferization.to_tensor â€¦    // prior load
+//   %other_t = bufferization.to_tensor â€?   // prior load
 //   %alloc = memref.alloc()
-//   memref.copy â€¦                           // active SRC
+//   memref.copy â€?                          // active SRC
 //   %loaded = bufferization.to_tensor %alloc
 //   %x = arith.select %mask, %loaded, %other_t
 // ---------------------------------------------------------------------------
@@ -438,7 +537,7 @@ LogicalResult LoadConverter::replaceMaskedLoadWithTensorOther(
                     UnitAttr::get(rewriter.getContext()));
   }
 
-  // Case 1: cast(mask) â†’ inactive is 0. Cover fp (uitofp/sitofp) and int
+  // Case 1: cast(mask) â†?inactive is 0. Cover fp (uitofp/sitofp) and int
   // (extui/extsi). Case 2: keep prior tensor as-is.
   Value otherVal = tensorOther;
   if (Value remappedOther = rewriter.getRemappedValue(tensorOther))
@@ -833,6 +932,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
   Value tensorOtherBase;
   Value deferredTailFillOther; // [TAIL-FILL] non-null => fill deferred to
                                // after the copy op
+  bool dynamicTailFill = false; // [TAIL-FILL-DYN] use the 3-segment form
   if (other) {
     auto scalarOther =
         mlir::ConverterUtils::getScalarValue(other, loc, rewriter);
@@ -854,6 +954,17 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
               mstate.getRank() == static_cast<int64_t>(bufTy.getRank()) &&
               tailFillDimsAligned(bufTy, mstate.dims))
             tailFillEligible = true;
+          else if (allZeroOffset && bufTy.hasStaticShape() &&
+                   mstate.getRank() == static_cast<int64_t>(bufTy.getRank()) &&
+                   dynamicTailFillEligible(allocOp) &&
+                   isDynamicTailFillEnabled()) {
+            // [TAIL-FILL-DYN] relax the static-dims gate: rank-1 with a
+            // runtime last-dim prefix (e.g. col < n_cols) defers the fill
+            // through the 3-segment dynamic form instead of falling back to
+            // the whole-buffer fill guarded by scf.if.
+            dynamicTailFill = true;
+            tailFillEligible = true;
+          }
         }
       }
       if (tailFillEligible) {
@@ -877,7 +988,8 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
   //
   // The basis is that last dimension range comparison would generate
   // unaccepted discontinuous mask.
-  if (!tensorOtherBase && mstate.getRank() == memRefType.getRank() &&
+  if (!tensorOtherBase && !deferredTailFillOther &&
+      mstate.getRank() == memRefType.getRank() &&
       isConstantIntValue(mstate.offsets.back(), 0) &&
       isConstantIntValue(mstate.dims.back(), memRefType.getShape().back())) {
     auto [ptrStrides, ptrOffsets] = memRefType.getStridesAndOffset();
@@ -914,8 +1026,12 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       // ordering dependency and the downstream sync solver may overlap
       // them.
       if (deferredTailFillOther) {
-        fillTailWithOtherForMaskScenario(deferredTailFillOther, allocOp,
-                                         mstate.dims, rewriter);
+        if (dynamicTailFill)
+          fillTailWithOtherDynamicScenario(deferredTailFillOther, allocOp,
+                                           mstate.dims, rewriter);
+        else
+          fillTailWithOtherForMaskScenario(deferredTailFillOther, allocOp,
+                                           mstate.dims, rewriter);
       }
     } else if (deferredTailFillOther) {
       // [TAIL-FILL] fallback: subview invalid => no copy will be emitted;
