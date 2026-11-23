@@ -1122,6 +1122,21 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
             std::cout << "[YJY]in the dynamic load mask " << std::endl;
             Operation *allocDef = allocOp.getDefiningOp();
             tailFillGroup = allocDef ? nextTailFillGroup(allocDef) : -1;
+            // [TAIL-FILL] Clamp the runtime valid extent to the padded size so
+            // a malformed mask (valid > padded) can never produce an
+            // out-of-bounds copy. The clamped value is the single SSA used by
+            // copy / head / tail, preserving the GSS adjacency proof.
+            if (auto v = mstate.dims.back().dyn_cast<Value>()) {
+              if (!v.getType().isIndex())
+                v = rewriter.create<arith::IndexCastOp>(
+                    loc, rewriter.getIndexType(), v);
+              Value paddedC = rewriter.create<arith::ConstantOp>(
+                  loc, rewriter.getIndexAttr(
+                           bufTy.getDimSize(bufTy.getRank() - 1)));
+              mstate.dims.back() =
+                  rewriter.create<arith::MinUIOp>(loc, v, paddedC)
+                      .getResult();
+            }
           }
         }
       }
