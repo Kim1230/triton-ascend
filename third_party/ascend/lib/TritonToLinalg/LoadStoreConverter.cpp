@@ -1,3 +1,4 @@
+#include <iostream>
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
@@ -1107,6 +1108,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
               !deinterleaveCandidate &&
               tailFillDimsAligned(bufTy, mstate.dims) && staticCostOk) {
             tailFillEligible = true;
+            std::cout << "[YJY]in the static load mask " << std::endl;
           } else if (allZeroOffset && shapeOk && rankOk && !allFull &&
                      !deinterleaveCandidate && staticCostOk &&
                      tailFillBufferBytes(bufTy) >= tailFillMinBytes() &&
@@ -1117,6 +1119,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
             // the whole-buffer fill guarded by scf.if.
             dynamicTailFill = true;
             tailFillEligible = true;
+            std::cout << "[YJY]in the dynamic load mask " << std::endl;
             Operation *allocDef = allocOp.getDefiningOp();
             tailFillGroup = allocDef ? nextTailFillGroup(allocDef) : -1;
           }
