@@ -465,6 +465,30 @@ fillTailWithOtherForMaskScenario(Value other, Value localMem,
 // static-shaped buffer with int/float elements whose size divides 32B. The
 // last dim of mstate.dims may be a runtime SSA value; prefix-from-zero is
 // checked by the caller.
+// [P3] Compile-time full-tile detection: if the SOURCE tensor's last dim
+// (N_COLS) is a compile-time constant AND is divisible by the padded
+// buffer's last dim (BLOCK), every strip is provably full (V == P).
+// Skip the dynamic branch entirely - no minui/guard/head/tail emitted.
+static bool tailFillCompileTimeFullTile(Value ptr, MemRefType bufTy) {
+  Value src = ptr;
+  for (int i = 0; i < 4; ++i) {
+    if (auto cast = dyn_cast_or_null<memref::ReinterpretCastOp>(
+            src.getDefiningOp())) {
+      src = cast.getSource();
+    } else {
+      break;
+    }
+  }
+  auto srcTy = dyn_cast<MemRefType>(src.getType());
+  if (!srcTy || srcTy.getRank() == 0 || bufTy.getRank() == 0)
+    return false;
+  int64_t srcLast = srcTy.getShape().back();
+  int64_t bufLast = bufTy.getShape().back();
+  if (srcLast == ShapedType::kDynamic || bufLast == ShapedType::kDynamic || bufLast <= 0)
+    return false;
+  return srcLast % bufLast == 0;
+}
+
 static bool dynamicTailFillEligible(Value localMem) {
   auto memRefType = dyn_cast<MemRefType>(localMem.getType());
   if (!memRefType || !memRefType.hasStaticShape())
@@ -1112,7 +1136,8 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
           } else if (allZeroOffset && shapeOk && rankOk && !allFull &&
                      !deinterleaveCandidate && staticCostOk &&
                      tailFillBufferBytes(bufTy) >= tailFillMinBytes() &&
-                     dynamicTailFillEligible(allocOp)) {
+                     dynamicTailFillEligible(allocOp) &&
+                     !tailFillCompileTimeFullTile(ptr, bufTy)) {
             // [TAIL-FILL-DYN] relax the static-dims gate: rank-1 with a
             // runtime last-dim prefix (e.g. col < n_cols) defers the fill
             // through the 3-segment dynamic form instead of falling back to
