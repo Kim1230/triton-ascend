@@ -523,6 +523,7 @@ static void emitDynamicTailSegments(OpBuilder &b, Location loc, Value other,
   const int64_t K = static_cast<int64_t>((32 * 8) / elemBits);
   Value paddedVal = b.create<arith::ConstantOp>(loc, b.getIndexAttr(padded));
   Value kVal = b.create<arith::ConstantOp>(loc, b.getIndexAttr(K));
+  (void)kVal; // [P1] modulo chain replaced by mask form below
   Value oneVal = b.create<arith::ConstantOp>(loc, b.getIndexAttr(1));
   Value zeroVal = b.create<arith::ConstantOp>(loc, b.getIndexAttr(0));
 
@@ -530,11 +531,19 @@ static void emitDynamicTailSegments(OpBuilder &b, Location loc, Value other,
   Value validLo = b.create<arith::MaxSIOp>(loc, validVal, zeroVal);
   Value validClamped = b.create<arith::MinSIOp>(loc, validLo, paddedVal);
 
-  // alignUp = validClamped + ((K - validClamped % K) % K), clamped to padded
-  Value rem = b.create<arith::RemSIOp>(loc, validClamped, kVal);
-  Value kMinusRem = b.create<arith::SubIOp>(loc, kVal, rem);
-  Value wrap = b.create<arith::RemSIOp>(loc, kMinusRem, kVal);
-  Value alignRaw = b.create<arith::AddIOp>(loc, validClamped, wrap);
+  // [TAIL-FILL][P1] K is a compile-time power of two, so
+  //   alignUp = v + ((K - v % K) % K)
+  // is exactly  (v + K - 1) & ~(K - 1), then clamped to padded.
+  // The mask form lowers to one ADD + one AND (+ the existing MIN) instead of
+  // two REM + SUB + ADD, which used to be expanded into a long sequence of
+  // shift / insert / saturating ops on the scalar unit (measured ~+78
+  // instructions per deferred load before this change).
+  Value kMinusOneVal =
+      b.create<arith::ConstantOp>(loc, b.getIndexAttr(K - 1));
+  Value kAlignMaskVal = b.create<arith::ConstantOp>(
+      loc, b.getIndexAttr(~static_cast<int64_t>(K - 1)));
+  Value alignBias = b.create<arith::AddIOp>(loc, validClamped, kMinusOneVal);
+  Value alignRaw = b.create<arith::AndIOp>(loc, alignBias, kAlignMaskVal);
   Value alignUp = b.create<arith::MinSIOp>(loc, alignRaw, paddedVal);
 
   // 1) narrow head: ONE linalg.fill on the small subview [validVal, alignUp).
