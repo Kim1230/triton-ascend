@@ -31,8 +31,6 @@
 
 #include <cstdlib>
 
-#include <optional>
-
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -489,57 +487,6 @@ static bool tailFillCompileTimeFullTile(Value ptr, MemRefType bufTy) {
   if (srcLast == ShapedType::kDynamic || bufLast == ShapedType::kDynamic || bufLast <= 0)
     return false;
   return srcLast % bufLast == 0;
-}
-
-// [P2'][TAIL-FILL]
-// 取 prefix mask（offs < C）里那个编译期常量 C。
-// 取不到 → 上界是运行期值（flatten kernel 的 n_elements），此时不启用 defer。
-static std::optional<int64_t> tailFillConstUpperBound(Value mask) {
-  auto cmp = mask.getDefiningOp<arith::CmpIOp>();
-  if (!cmp)
-    return std::nullopt;
-  // 形如 `offs < C` / `offs <= C`
-  if (auto c = getConstantIntValue(cmp.getRhs())) {
-    switch (cmp.getPredicate()) {
-    case arith::CmpIPredicate::slt:
-    case arith::CmpIPredicate::ult:
-    case arith::CmpIPredicate::sle:
-    case arith::CmpIPredicate::ule:
-      return *c;
-    default:
-      break;
-    }
-  }
-  // 形如 `C > offs` / `C >= offs`
-  if (auto c = getConstantIntValue(cmp.getLhs())) {
-    switch (cmp.getPredicate()) {
-    case arith::CmpIPredicate::sgt:
-    case arith::CmpIPredicate::ugt:
-      return *c - 1;
-    case arith::CmpIPredicate::sge:
-    case arith::CmpIPredicate::uge:
-      return *c;
-    default:
-      break;
-    }
-  }
-  return std::nullopt;
-}
-
-// [P2'][TAIL-FILL] 只有尾块占比足够大，defer 才划算：
-//   收益 ≈ Vtail（省掉的填充）+ 1 对 fill->copy sync
-//   代价 ≈ (P - Vtail) * k（动态长度 fill 每元素贵 k≈3.5 倍）+ ~190 条标量
-//   (V+P) - k(P-V) > 0  <=>  V/P > (k-1)/(k+1) ≈ 0.55
-static bool tailFillRatioAllows(Value mask, int64_t padded) {
-  if (padded <= 0)
-    return false;
-  auto ub = tailFillConstUpperBound(mask);
-  if (!ub)
-    return false; // 运行期上界（flatten 家族）→ 禁用
-  const int64_t vTail = *ub % padded;
-  if (vTail == 0)
-    return true; // 全满：交给 P3 处理
-  return vTail * 100 >= padded * 55; // V/P >= 0.55
 }
 
 static bool dynamicTailFillEligible(Value localMem) {
@@ -1199,10 +1146,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
                      !deinterleaveCandidate && staticCostOk &&
                      tailFillBufferBytes(bufTy) >= tailFillMinBytes() &&
                      dynamicTailFillEligible(allocOp) &&
-                     !tailFillCompileTimeFullTile(ptr, bufTy) &&
-                     mask &&
-                     tailFillRatioAllows(
-                          mask, bufTy.getShape().back())) {
+                     !tailFillCompileTimeFullTile(ptr, bufTy)) {
             // [TAIL-FILL-DYN] relax the static-dims gate: rank-1 with a
             // runtime last-dim prefix (e.g. col < n_cols) defers the fill
             // through the 3-segment dynamic form instead of falling back to
